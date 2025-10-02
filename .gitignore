@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribuzioni
+build/
+dist/
+*.egg-info/
+
+# Ambiente virtuale
+venv/
+env/
+.venv/
+
+# File di log e database temporanei
+*.log
+*.sqlite
+*.db
+
+# File JSON generati (se non devono essere versionati)
+*.json
+
+# Config editor e IDE
+.vscode/
+.idea/
+
+# File di sistema
+.DS_Store
+Thumbs.db
+
+# Eseguiti/compilati
+*.exe
+*.dll
+*.so
+*.pyd
+
+# PyInstaller
+*.spec
+
+# Backup temporanei
+*~
+*.bak
+*.tmp
+
+# Tkinter .ico o immagini generate
+*.ico
+*.png
+
+# Cartelle create da PyInstaller (o simili)
+build/
+dist/
+*.spec
