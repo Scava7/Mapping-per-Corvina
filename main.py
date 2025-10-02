@@ -3,18 +3,22 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Any, Dict, List, Tuple, Optional
+
 from tksheet import Sheet
 
+
 # ------------------------------------------------------------
-# Editor JSON Mapping — v0.3 (Tkinter + tksheet)
+# Editor JSON Mapping — v0.4 (Tkinter + tksheet)
 # ------------------------------------------------------------
-# - "Tabella" a tutta larghezza (pane ridimensionabile) + colonne richieste
-# - Editing direttamente in tabella
-# - Filtri per colonna (stile Excel: combobox per domini, testo/operatore per numeri)
+# - Tabella principale ridimensionabile (splitter) + colonne richieste
+# - Editing diretto in tabella
+# - Filtri per colonna stile Excel (combo per domini, operatori nei numerici)
+# - "deadband type" con menu a tendina (solo ABS/PERC), anche su doppio click
+# - Ordinamento: click sull'header alterna A→Z / Z→A
 # - Salvataggio con backup .bak
-# - Mapping campi trigger[0] (estendibile a N triggers)
+# - Mapping campi trigger[0] (estendibile)
 # ------------------------------------------------------------
-APP_TITLE = "Editor JSON Mapping — Dragflow (v0.3)"
+APP_TITLE = "Editor JSON Mapping — Dragflow (v0.4)"
 
 # ----------------- Utility nested path -----------------
 
@@ -78,8 +82,71 @@ HEADERS = [
 ]
 
 IDX = {h:i for i,h in enumerate(HEADERS)}
+NUMERIC_COLS = {
+    IDX["level"], IDX["min interval ms"], IDX["skip first n changes"], IDX["deadband"]
+}
 
 class MappingEditor(ttk.Frame):
+
+    def _refresh_headers_with_arrow(self):
+        hdrs = HEADERS.copy()
+        if self._last_sort_col is not None:
+            arrow = "▲" if self._last_sort_asc else "▼"
+            hdrs[self._last_sort_col] = f"{hdrs[self._last_sort_col]} {arrow}"
+        self.sheet.headers(hdrs)
+        
+    def _event_to_col(self, event) -> Optional[int]:
+        """
+        Cerca di estrarre l'indice colonna dall'evento tksheet, qualunque sia il formato.
+        Ritorna None se non trova nulla.
+        """
+        # Caso 1: dict stile tksheet {'column': int} o con altre chiavi
+        if isinstance(event, dict):
+            for key in ("column", "col", "c", "index", "selected", "selected_column"):
+                v = event.get(key, None)
+                if isinstance(v, int):
+                    return v
+                if isinstance(v, (list, tuple)) and v and isinstance(v[0], int):
+                    return v[0]
+            # come fallback, cerca qualsiasi int nei valori
+            for v in event.values():
+                if isinstance(v, int):
+                    return v
+                if isinstance(v, (list, tuple)) and v and isinstance(v[0], int):
+                    return v[0]
+
+        # Caso 2: oggetto con attributi .column / simili
+        try:
+            for attr in ("column", "col", "c", "index"):
+                if hasattr(event, attr):
+                    v = getattr(event, attr)
+                    if isinstance(v, int):
+                        return v
+        except Exception:
+            pass
+
+        # Caso 3: tuple/list (alcune versioni passano (something, col, ...))
+        if isinstance(event, (tuple, list)):
+            for item in event:
+                if isinstance(item, int):
+                    return item
+                if isinstance(item, (list, tuple)) and item and isinstance(item[0], int):
+                    return item[0]
+
+        # Caso 4: usa colonna selezionata (fallback garantito)
+        try:
+            cols = []
+            if hasattr(self.sheet, "get_selected_columns"):
+                cols = self.sheet.get_selected_columns() or []
+            if not cols and hasattr(self.sheet, "get_selected_cols"):
+                cols = self.sheet.get_selected_cols() or []
+            if cols:
+                return cols[0]
+        except Exception:
+            pass
+        return None
+
+
     def __init__(self, master):
         super().__init__(master)
         self.pack(fill=tk.BOTH, expand=True)
@@ -101,6 +168,23 @@ class MappingEditor(ttk.Frame):
         self.row_to_path: List[str] = []  # mappa indice rows_all -> path
         self.view_index_map: List[int] = []  # mappa indice rows_view -> indice in rows_all
 
+        # stato ordinamento
+        self._last_sort_col: Optional[int] = None
+        self._last_sort_asc: bool = True
+
+        # overlay combobox per deadband type
+        self._overlay_combo: Optional[ttk.Combobox] = None
+        self._overlay_cell: Optional[Tuple[int,int]] = None
+        self._prev_cell_value: Optional[str] = None
+
+        # stato sort per colonna (True = prossimo click A→Z, False = Z→A)
+        self.sort_dir_by_col: Dict[int, bool] = {}
+        self.sort_buttons: Dict[int, ttk.Button] = {}
+
+        self.var_name = tk.StringVar(value="")
+        self.var_instance = tk.StringVar(value="")
+
+
         self._build_ui()
 
     # ---------------- UI -----------------
@@ -109,8 +193,8 @@ class MappingEditor(ttk.Frame):
             f = ttk.Frame(self)
             f.pack(fill="both", expand=True, padx=12, pady=12)
             ttk.Label(f, text=(
-                "Manca la dipendenza 'tksheet'.\n"
-                "Installa con: pip install tksheet",
+                """Manca la dipendenza 'tksheet'.
+Installa con: pip install tksheet"""
             )).pack()
             return
 
@@ -125,6 +209,11 @@ class MappingEditor(ttk.Frame):
         self.btn_save.pack(side=tk.LEFT, padx=(6, 0))
         self.btn_save_as = ttk.Button(toolbar, text="Salva come…", command=self.on_save_as, state=tk.DISABLED)
         self.btn_save_as.pack(side=tk.LEFT, padx=(6, 0))
+
+        style = ttk.Style(self)
+        style.configure("Small.TEntry", font=("Segoe UI", 9), padding=(2, 1))
+        style.configure("Small.TCombobox", font=("Segoe UI", 9), padding=(2, 1))
+        style.configure("Small.TButton", font=("Segoe UI", 9), padding=(2, 0))
 
         # Filter row (per colonna)
         self.filter_bar = ttk.Frame(self)
@@ -158,16 +247,51 @@ class MappingEditor(ttk.Frame):
             "drop_select",
             "column_width_resize",
             "double_click_column_resize",
-            "sort",
         ))
+
         self.sheet.grid(row=0, column=0, sticky="nsew")
+
+        # Bind per editing/ordinamento
+        # Bind per editing / ordinamento
+        try:
+            self.sheet.extra_bind("begin_edit_cell", self._on_begin_edit_cell)
+            self.sheet.extra_bind("end_edit_cell", self._on_end_edit_cell)
+            self.sheet.extra_bind("double_click_cell", self._on_double_click_cell)
+
+            # Click sull'header → ordina A→Z / Z→A
+            """self.sheet.extra_bind("header_left_click", self._on_header_click)
+            self.sheet.extra_bind("header_double_click", self._on_header_click)
+            self.sheet.extra_bind("column_select", self._on_header_click)"""
+
+        except Exception:
+            # Se una di queste binding non esiste nella versione di tksheet, ignora
+            pass
+
 
         # right: dettagli minimi (opzionale)
         self.right = ttk.Frame(paned)
+
+        meta = ttk.LabelFrame(self.right, text="Meta")
+        meta.pack(fill="x", padx=8, pady=(8, 4))
+        meta.columnconfigure(1, weight=1)
+
+        ttk.Label(meta, text="name").grid(row=0, column=0, sticky="w", padx=(4,2), pady=2)
+        ttk.Entry(meta, textvariable=self.var_name, width=28).grid(row=0, column=1, sticky="ew", padx=(2,4), pady=2)
+
+        ttk.Label(meta, text="instanceOf").grid(row=1, column=0, sticky="w", padx=(4,2), pady=2)
+        ttk.Entry(meta, textvariable=self.var_instance, width=28).grid(row=1, column=1, sticky="ew", padx=(2,4), pady=2)
+
+
         ttk.Label(self.right, text="Dettagli (opz.)", foreground="#666").pack(anchor="w", padx=8, pady=8)
-        ttk.Label(self.right, text="La maggior parte dell'editing avviene direttamente in tabella.\n"
-                                  "A destra puoi inserire funzioni future (diff, preset, ecc.)",
-                  wraplength=260, foreground="#666").pack(anchor="w", padx=8)
+        ttk.Label(
+            self.right,
+            text=(
+                """La maggior parte dell'editing avviene direttamente in tabella.
+A destra puoi inserire funzioni future (diff, preset, ecc.)"""
+            ),
+            wraplength=260,
+            foreground="#666",
+        ).pack(anchor="w", padx=8)
 
         paned.add(self.left, weight=4)
         paned.add(self.right, weight=1)
@@ -185,7 +309,8 @@ class MappingEditor(ttk.Frame):
         self.filters: Dict[str, tk.Variable] = {}
         grid = ttk.Frame(parent)
         grid.pack(fill="x")
-        # costruiamo una riga di widget con proporzioni
+
+        # colonna -> (nome, tipo_widget)
         coldefs = [
             ("type", "combo"),
             ("label", "text"),
@@ -193,28 +318,43 @@ class MappingEditor(ttk.Frame):
             ("trigger type", "combo"),
             ("level", "text"),             # supporta >, >=, <, <=, =
             ("mode", "combo"),
-            ("min interval ms", "text"),    # supporta operatori
+            ("min interval ms", "text"),   # supporta operatori
             ("skip first n changes", "text"),
             ("change mask", "combo"),
-            ("deadband", "text"),           # supporta operatori
+            ("deadband", "text"),          # supporta operatori
             ("deadband type", "combo"),
         ]
+
         for i, (name, kind) in enumerate(coldefs):
             grid.columnconfigure(i, weight=1)
-            lbl = ttk.Label(grid, text=name)
-            lbl.grid(row=0, column=i, sticky="w", padx=2)
+
+            # Etichetta riga 0
+            ttk.Label(grid, text=name).grid(row=0, column=i, sticky="w", padx=2)
+
+            # Celle riga 1: un frame con input + pulsante sort
+            cell = ttk.Frame(grid)
+            cell.grid(row=1, column=i, sticky="ew", padx=2, pady=2)
+            cell.columnconfigure(0, weight=1)  # input si espande, bottone resta stretto
+
+            # Input filtro
             if kind == "combo":
                 var = tk.StringVar()
-                cb = ttk.Combobox(grid, textvariable=var, state="readonly")
-                cb.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
-                cb.grid(row=1, column=i, sticky="ew", padx=2, pady=2)
-                self.filters[name] = var
+                inp = ttk.Combobox(cell, textvariable=var, state="readonly")
+                inp.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
             else:
                 var = tk.StringVar()
-                ent = ttk.Entry(grid, textvariable=var)
-                ent.bind("<KeyRelease>", lambda e: self.apply_filters())
-                ent.grid(row=1, column=i, sticky="ew", padx=2, pady=2)
-                self.filters[name] = var
+                inp = ttk.Entry(cell, textvariable=var)
+                inp.bind("<KeyRelease>", lambda e: self.apply_filters())
+            inp.grid(row=0, column=0, sticky="ew")
+
+            self.filters[name] = var  # memorizzo la variabile del filtro
+
+            # Pulsantino sort (testo dipende dalla prossima direzione prevista)
+            col_index = i
+            btn = ttk.Button(cell, text="A→Z", width=4, command=lambda c=col_index: self._on_sort_button(c))
+            btn.grid(row=0, column=1, sticky="e", padx=(4, 0))
+            self.sort_dir_by_col[col_index] = True      # prossimo click = A→Z
+            self.sort_buttons[col_index] = btn
 
     # -------------- File ops ---------------
     def on_open(self):
@@ -230,7 +370,8 @@ class MappingEditor(ttk.Frame):
             self.status.set(f"Caricato: {os.path.basename(path)}")
             self._reindex()
         except Exception as e:
-            messagebox.showerror(APP_TITLE, f"Errore apertura file:\n{e}")
+            messagebox.showerror(APP_TITLE, f"""Errore apertura file:
+{e}""")
 
     def on_save(self):
         if not (self.file_path and self.data):
@@ -251,7 +392,8 @@ class MappingEditor(ttk.Frame):
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             self.status.set(f"Salvato: {self.file_path}")
         except Exception as e:
-            messagebox.showerror(APP_TITLE, f"Errore salvataggio:\n{e}")
+            messagebox.showerror(APP_TITLE, f"""Errore salvataggio:
+{e}""")
 
     def on_save_as(self):
         if not self.data:
@@ -352,16 +494,20 @@ class MappingEditor(ttk.Frame):
         set_combo("deadband type", ["ABS", "PERC"]) 
 
     def _find_filter_widget(self, name: str):
-        # cerca in self.filter_bar
+        # cerca la Label con quel testo e ritorna l'input (Entry/Combobox) nella cella sotto
         for child in self.filter_bar.winfo_children():
             for sub in child.winfo_children():
                 if isinstance(sub, ttk.Label) and sub.cget("text") == name:
-                    # l'entry/combo è riga successiva stessa colonna
                     info = sub.grid_info()
+                    # widget al row successivo, stessa colonna
                     for peer in child.winfo_children():
                         if peer.grid_info().get("row") == info["row"] + 1 and peer.grid_info().get("column") == info["column"]:
-                            return peer
+                            # dentro il peer (frame), cerca Entry/Combobox
+                            for inner in peer.winfo_children():
+                                if isinstance(inner, ttk.Combobox) or isinstance(inner, ttk.Entry):
+                                    return inner
         return None
+
 
     # -------------- Filtering ---------------
     def apply_filters(self):
@@ -405,7 +551,11 @@ class MappingEditor(ttk.Frame):
 
         # aggiorna sheet
         self.sheet.set_sheet_data(self.rows_view, reset_col_positions=True, reset_row_positions=True)
-        self.sheet.headers(HEADERS)
+        self._refresh_headers_with_arrow()
+        # riapplica l’ultimo ordinamento (se presente)
+        if self._last_sort_col is not None:
+            self._sort_view_by(self._last_sort_col, self._last_sort_asc)
+
 
     def _get_filter_value(self, name: str) -> str:
         w = self._find_filter_widget(name)
@@ -413,13 +563,211 @@ class MappingEditor(ttk.Frame):
             return w.get()
         return ""
 
+    # -------------- Sorting ---------------
+   
+    def _on_header_click(self, event=None):
+        col = self._event_to_col(event)
+        if col is None:
+            # niente colonna -> esco zitto
+            return
+
+        # toggle direzione
+        if self._last_sort_col == col:
+            self._last_sort_asc = not self._last_sort_asc
+        else:
+            self._last_sort_col = col
+            self._last_sort_asc = True
+
+        # ordina + seleziona visivamente
+        self._sort_view_by(col, self._last_sort_asc)
+        try:
+            self.sheet.select_column(col)
+        except Exception:
+            pass
+
+        # feedback chiaro in statusbar (utile anche per debug)
+        direction = "A→Z" if self._last_sort_asc else "Z→A"
+        try:
+            header_text = HEADERS[col]
+        except Exception:
+            header_text = f"col {col}"
+        self.status.set(f"Ordinato per {header_text} ({direction})")
+
+    def _on_sort_button(self, col: int):
+        """
+        Ordina la tabella per la colonna 'col'.
+        Il pulsante alterna A→Z / Z→A ad ogni pressione.
+        """
+        # direzione corrente (quella da usare ORA)
+        asc = self.sort_dir_by_col.get(col, True)
+
+        # memorizza come "ultimo ordinamento" globale (per mantenere l'ordinamento dopo i filtri)
+        self._last_sort_col = col
+        self._last_sort_asc = asc
+
+        # ordina
+        self._sort_view_by(col, asc)
+
+        # prepara prossima direzione per questa colonna e aggiorna etichetta del pulsante
+        self.sort_dir_by_col[col] = not asc
+        self._update_sort_button_label(col)
+
+    def _update_sort_button_label(self, col: int):
+        """
+        Aggiorna la scritta del pulsante in base alla prossima direzione prevista.
+        True  -> "A→Z"
+        False -> "Z→A"
+        """
+        btn = self.sort_buttons.get(col)
+        if not btn:
+            return
+        next_is_asc = self.sort_dir_by_col.get(col, True)
+        btn.configure(text=("A→Z" if next_is_asc else "Z→A"))
+
+
+    def _sort_view_by(self, col: int, ascending: bool):
+        pairs = list(zip(self.rows_view, self.view_index_map))
+
+        def key_fn(item):
+            row, _ = item
+            v = row[col]
+            if col in NUMERIC_COLS:
+                try:
+                    return (0, float(v))   # numeri prima
+                except Exception:
+                    return (1, str(v).lower())  # non numerici dopo
+            return (0, str(v).lower())
+
+        pairs.sort(key=key_fn, reverse=not ascending)
+        self.rows_view = [r for r, _ in pairs]
+        self.view_index_map = [i for _, i in pairs]
+        self.sheet.set_sheet_data(self.rows_view, reset_col_positions=False, reset_row_positions=True)
+        self._refresh_headers_with_arrow()
+
+
+
+    # -------------- In-cell editing helpers ---------------
+    def _on_begin_edit_cell(self, _event=None):
+        sel = None
+        try:
+            sel = self.sheet.get_currently_selected()
+        except Exception:
+            return
+        row, col = None, None
+        if isinstance(sel, dict) and sel.get("type") == "cell":
+            row, col = sel.get("row"), sel.get("column")
+        elif isinstance(sel, tuple) and len(sel) >= 2:
+            row, col = sel[0], sel[1]
+        else:
+            return
+        # memorizza valore precedente
+        try:
+            self._prev_cell_value = self.sheet.get_cell_data(row, col)
+        except Exception:
+            self._prev_cell_value = None
+        # se deadband type -> apri combo overlay
+        if col == IDX["deadband type"]:
+            self.after(1, lambda r=row, c=col: self._open_deadband_combo(r, c))
+
+    def _on_double_click_cell(self, _event=None):
+        # fallback: su doppio click in deadband type apri combo
+        sel = None
+        try:
+            sel = self.sheet.get_currently_selected()
+        except Exception:
+            return
+        if isinstance(sel, dict) and sel.get("type") == "cell":
+            row, col = sel.get("row"), sel.get("column")
+        elif isinstance(sel, tuple) and len(sel) >= 2:
+            row, col = sel[0], sel[1]
+        else:
+            return
+        if col == IDX["deadband type"]:
+            self._open_deadband_combo(row, col)
+
+    def _on_end_edit_cell(self, _event=None):
+        # valida i valori dopo edit (gestisce anche paste)
+        sel = None
+        try:
+            sel = self.sheet.get_currently_selected()
+        except Exception:
+            return
+        row, col = None, None
+        if isinstance(sel, dict) and sel.get("type") == "cell":
+            row, col = sel.get("row"), sel.get("column")
+        elif isinstance(sel, tuple) and len(sel) >= 2:
+            row, col = sel[0], sel[1]
+        else:
+            return
+        if col == IDX["deadband type"]:
+            try:
+                val = str(self.sheet.get_cell_data(row, col)).upper().strip()
+            except Exception:
+                return
+            if val not in ("ABS", "PERC"):
+                # ripristina precedente (o stringa vuota)
+                prev = self._prev_cell_value
+                if prev in ("ABS", "PERC"):
+                    self.sheet.set_cell_data(row, col, prev)
+                else:
+                    self.sheet.set_cell_data(row, col, "")
+            else:
+                # normalizza uppercase
+                self.sheet.set_cell_data(row, col, val)
+
+    def _open_deadband_combo(self, row: int, col: int):
+        # chiudi eventuale combo precedente
+        if self._overlay_combo is not None:
+            try:
+                self._overlay_combo.destroy()
+            except Exception:
+                pass
+            self._overlay_combo = None
+            self._overlay_cell = None
+        # bbox cella
+        try:
+            x, y, w, h = self.sheet.get_cell_bbox(row, col, include_text=True)
+        except Exception:
+            return
+        combo = ttk.Combobox(self.sheet, values=["ABS", "PERC"], state="readonly")
+        try:
+            current = str(self.sheet.get_cell_data(row, col)).upper().strip()
+            if current in ("ABS", "PERC"):
+                combo.set(current)
+        except Exception:
+            pass
+        combo.place(x=x, y=y, width=max(60, w), height=h)
+        combo.focus_set()
+        combo.bind("<<ComboboxSelected>>", lambda e: self._commit_deadband_combo(row, col, combo))
+        combo.bind("<Return>", lambda e: self._commit_deadband_combo(row, col, combo))
+        combo.bind("<Escape>", lambda e: self._destroy_overlay_combo())
+        combo.bind("<FocusOut>", lambda e: self._destroy_overlay_combo())
+        self._overlay_combo = combo
+        self._overlay_cell = (row, col)
+
+    def _commit_deadband_combo(self, row: int, col: int, combo: ttk.Combobox):
+        val = combo.get().strip().upper()
+        if val not in ("ABS", "PERC"):
+            return
+        self.sheet.set_cell_data(row, col, val)
+        self._destroy_overlay_combo()
+
+    def _destroy_overlay_combo(self):
+        if self._overlay_combo is not None:
+            try:
+                self._overlay_combo.destroy()
+            except Exception:
+                pass
+        self._overlay_combo = None
+        self._overlay_cell = None
+
     # -------------- Commit ---------------
     def _commit_table_to_json(self):
         if not self.data:
             return
         # sincronizza rows_view -> rows_all (l'utente può aver editato nella vista filtrata)
         # leggiamo i dati attuali della sheet
-        current = self.sheet.get_sheet_data(return_copy=True)
+        current = [list(r) for r in self.sheet.get_sheet_data()]  # copia profonda semplice
         # aggiorna rows_view con current e propaga a rows_all per le righe visibili
         for idx_view, row_vals in enumerate(current):
             idx_all = self.view_index_map[idx_view]
@@ -427,6 +775,17 @@ class MappingEditor(ttk.Frame):
 
         # applica rows_all nel JSON
         root = self.data.get("json") or self.data
+
+        # commit meta
+        nm = self.var_name.get().strip()
+        if nm != "":
+            self.data["name"] = nm
+
+        inst = self.var_instance.get().strip()
+        if inst != "":
+            root["instanceOf"] = inst
+
+
         props = root.get("properties", {})
 
         errors: List[str] = []
@@ -537,8 +896,6 @@ class MappingEditor(ttk.Frame):
         if errors:
             raise ValueError("\n".join(errors))
 
-    # ---------------- Form helpers (non usati in v0.3) ----------------
-
 # ---------------- main ----------------
 
 def main():
@@ -569,7 +926,8 @@ def main():
                 app.status.set(f"Caricato: {os.path.basename(default_path)}")
                 app._reindex()
         except Exception as e:
-            messagebox.showwarning(APP_TITLE, f"Apertura iniziale fallita: {e}")
+            messagebox.showwarning(APP_TITLE, f"""Apertura iniziale fallita:
+{e}""")
 
     root.mainloop()
 
