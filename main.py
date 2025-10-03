@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+"""
+Editor JSON Mapping — Dragflow (v0.4)
+Requisiti:  pip install tksheet
+"""
 import json
 import os
 import tkinter as tk
@@ -6,22 +11,9 @@ from typing import Any, Dict, List, Tuple, Optional
 
 from tksheet import Sheet
 
-
-# ------------------------------------------------------------
-# Editor JSON Mapping — v0.4 (Tkinter + tksheet)
-# ------------------------------------------------------------
-# - Tabella principale ridimensionabile (splitter) + colonne richieste
-# - Editing diretto in tabella
-# - Filtri per colonna stile Excel (combo per domini, operatori nei numerici)
-# - "deadband type" con menu a tendina (solo ABS/PERC), anche su doppio click
-# - Ordinamento: click sull'header alterna A→Z / Z→A
-# - Salvataggio con backup .bak
-# - Mapping campi trigger[0] (estendibile)
-# ------------------------------------------------------------
 APP_TITLE = "Editor JSON Mapping — Dragflow (v0.4)"
 
-# ----------------- Utility nested path -----------------
-
+# ----------------- Utility (non usate ovunque, ma comode se servono) -----------------
 def safe_get(d: Dict[str, Any], path: List[str]):
     cur: Any = d
     for p in path:
@@ -65,8 +57,7 @@ def safe_set(d: Dict[str, Any], path: List[str], value: Any):
             cur = cur[p]
     return False
 
-# ----------------- App -----------------
-
+# ----------------- Tabella -----------------
 HEADERS = [
     "type",                # top-level type
     "label",
@@ -76,31 +67,25 @@ HEADERS = [
     "mode",                # triggers[0].mode
     "min interval ms",     # triggers[0].minIntervalMs
     "skip first n changes",# triggers[0].skipFirstNChanges
-    "change mask",         # triggers[0].changeMask (string domain)
+    "change mask",         # triggers[0].changeMask
     "deadband",            # triggers[0].deadband OR deadbandPercent
-    "deadband type"        # ABS (deadband) | PERC (deadbandPercent)
+    "deadband type"        # ABS | PERC
 ]
+IDX = {h: i for i, h in enumerate(HEADERS)}
+NUMERIC_COLS = {IDX["level"], IDX["min interval ms"], IDX["skip first n changes"], IDX["deadband"]}
 
-IDX = {h:i for i,h in enumerate(HEADERS)}
-NUMERIC_COLS = {
-    IDX["level"], IDX["min interval ms"], IDX["skip first n changes"], IDX["deadband"]
-}
 
 class MappingEditor(ttk.Frame):
-
+    # ---------- helper: frecce header ----------
     def _refresh_headers_with_arrow(self):
         hdrs = HEADERS.copy()
         if self._last_sort_col is not None:
             arrow = "▲" if self._last_sort_asc else "▼"
             hdrs[self._last_sort_col] = f"{hdrs[self._last_sort_col]} {arrow}"
         self.sheet.headers(hdrs)
-        
+
+    # ---------- helper: estrai colonna da evento (se mai servisse) ----------
     def _event_to_col(self, event) -> Optional[int]:
-        """
-        Cerca di estrarre l'indice colonna dall'evento tksheet, qualunque sia il formato.
-        Ritorna None se non trova nulla.
-        """
-        # Caso 1: dict stile tksheet {'column': int} o con altre chiavi
         if isinstance(event, dict):
             for key in ("column", "col", "c", "index", "selected", "selected_column"):
                 v = event.get(key, None)
@@ -108,14 +93,11 @@ class MappingEditor(ttk.Frame):
                     return v
                 if isinstance(v, (list, tuple)) and v and isinstance(v[0], int):
                     return v[0]
-            # come fallback, cerca qualsiasi int nei valori
             for v in event.values():
                 if isinstance(v, int):
                     return v
                 if isinstance(v, (list, tuple)) and v and isinstance(v[0], int):
                     return v[0]
-
-        # Caso 2: oggetto con attributi .column / simili
         try:
             for attr in ("column", "col", "c", "index"):
                 if hasattr(event, attr):
@@ -124,16 +106,12 @@ class MappingEditor(ttk.Frame):
                         return v
         except Exception:
             pass
-
-        # Caso 3: tuple/list (alcune versioni passano (something, col, ...))
         if isinstance(event, (tuple, list)):
             for item in event:
                 if isinstance(item, int):
                     return item
                 if isinstance(item, (list, tuple)) and item and isinstance(item[0], int):
                     return item[0]
-
-        # Caso 4: usa colonna selezionata (fallback garantito)
         try:
             cols = []
             if hasattr(self.sheet, "get_selected_columns"):
@@ -146,7 +124,7 @@ class MappingEditor(ttk.Frame):
             pass
         return None
 
-
+    # ---------- init ----------
     def __init__(self, master):
         super().__init__(master)
         self.pack(fill=tk.BOTH, expand=True)
@@ -155,35 +133,35 @@ class MappingEditor(ttk.Frame):
         self.data: Optional[Dict[str, Any]] = None
         self.property_items: List[Tuple[str, Dict[str, Any]]] = []
 
-        # Domini
-        self.domain_types: List[str] = []          # top-level type
+        # Domini per i combo filtro
+        self.domain_types: List[str] = []
         self.domain_units: List[str] = []
-        self.domain_trig_types: List[str] = []     # trigger type
-        self.domain_trig_modes: List[str] = []     # trigger mode
-        self.domain_change_masks: List[str] = []   # changeMask strings
+        self.domain_trig_types: List[str] = []
+        self.domain_trig_modes: List[str] = []
+        self.domain_change_masks: List[str] = []
 
-        # dataset completo (tutte le righe) e dataset filtrato per la tabella
+        # Dataset completo e vista filtrata
         self.rows_all: List[List[Any]] = []
         self.rows_view: List[List[Any]] = []
-        self.row_to_path: List[str] = []  # mappa indice rows_all -> path
-        self.view_index_map: List[int] = []  # mappa indice rows_view -> indice in rows_all
+        self.row_to_path: List[str] = []
+        self.view_index_map: List[int] = []
 
-        # stato ordinamento
+        # Stato ordinamento globale
         self._last_sort_col: Optional[int] = None
         self._last_sort_asc: bool = True
 
-        # overlay combobox per deadband type
+        # Overlay combobox per deadband type
         self._overlay_combo: Optional[ttk.Combobox] = None
-        self._overlay_cell: Optional[Tuple[int,int]] = None
+        self._overlay_cell: Optional[Tuple[int, int]] = None
         self._prev_cell_value: Optional[str] = None
 
-        # stato sort per colonna (True = prossimo click A→Z, False = Z→A)
+        # Stato sort per colonna (pulsanti)
         self.sort_dir_by_col: Dict[int, bool] = {}
         self.sort_buttons: Dict[int, ttk.Button] = {}
 
+        # Meta (GUI)
         self.var_name = tk.StringVar(value="")
         self.var_instance = tk.StringVar(value="")
-
 
         self._build_ui()
 
@@ -203,28 +181,30 @@ Installa con: pip install tksheet"""
 
         # Toolbar
         toolbar = ttk.Frame(self)
-        toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6,3))
+        toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 3))
         ttk.Button(toolbar, text="Apri…", command=self.on_open).pack(side=tk.LEFT)
         self.btn_save = ttk.Button(toolbar, text="Salva", command=self.on_save, state=tk.DISABLED)
         self.btn_save.pack(side=tk.LEFT, padx=(6, 0))
         self.btn_save_as = ttk.Button(toolbar, text="Salva come…", command=self.on_save_as, state=tk.DISABLED)
         self.btn_save_as.pack(side=tk.LEFT, padx=(6, 0))
 
+        # Stili compatti
         style = ttk.Style(self)
-        style.configure("Small.TEntry", font=("Segoe UI", 9), padding=(2, 1))
-        style.configure("Small.TCombobox", font=("Segoe UI", 9), padding=(2, 1))
-        style.configure("Small.TButton", font=("Segoe UI", 9), padding=(2, 0))
+        style.configure(".", font=("Segoe UI", 9))
+        style.configure("Small.TEntry", padding=(2, 1))
+        style.configure("Small.TCombobox", padding=(2, 1))
+        style.configure("Small.TButton", padding=(2, 0))
 
-        # Filter row (per colonna)
+        # Filtro per colonna
         self.filter_bar = ttk.Frame(self)
-        self.filter_bar.grid(row=1, column=0, sticky="ew", padx=6, pady=(0,3))
+        self.filter_bar.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 3))
         self._build_filters(self.filter_bar)
 
-        # Paned (tabella = principale)
+        # Paned (tabella principale)
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        paned.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0,6))
+        paned.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
 
-        # left: sheet
+        # left: tksheet
         self.left = ttk.Frame(paned)
         self.left.rowconfigure(0, weight=1)
         self.left.columnconfigure(0, weight=1)
@@ -248,39 +228,47 @@ Installa con: pip install tksheet"""
             "column_width_resize",
             "double_click_column_resize",
         ))
+        # Font compatti per tksheet (usa tuple a 3 elementi)
+        try:
+            self.sheet.set_options(
+                table_font=("Segoe UI", 9, "normal"),
+                header_font=("Segoe UI", 9, "normal"),
+            )
+            self.sheet.set_header_height(20)  # opzionale, per header più basso
+        except Exception:
+            # Fallback sicuro (se la tua versione di tksheet vuole un altro font)
+            try:
+                self.sheet.set_options(
+                    table_font=("Arial", 9, "normal"),
+                    header_font=("Arial", 9, "normal"),
+                )
+            except Exception:
+                pass
 
         self.sheet.grid(row=0, column=0, sticky="nsew")
 
-        # Bind per editing/ordinamento
-        # Bind per editing / ordinamento
+        # Bind di editing (NO bind header: usiamo i pulsanti sort)
         try:
             self.sheet.extra_bind("begin_edit_cell", self._on_begin_edit_cell)
             self.sheet.extra_bind("end_edit_cell", self._on_end_edit_cell)
             self.sheet.extra_bind("double_click_cell", self._on_double_click_cell)
-
-            # Click sull'header → ordina A→Z / Z→A
-            """self.sheet.extra_bind("header_left_click", self._on_header_click)
-            self.sheet.extra_bind("header_double_click", self._on_header_click)
-            self.sheet.extra_bind("column_select", self._on_header_click)"""
-
         except Exception:
-            # Se una di queste binding non esiste nella versione di tksheet, ignora
             pass
 
-
-        # right: dettagli minimi (opzionale)
+        # right: pannello meta + note
         self.right = ttk.Frame(paned)
 
         meta = ttk.LabelFrame(self.right, text="Meta")
         meta.pack(fill="x", padx=8, pady=(8, 4))
         meta.columnconfigure(1, weight=1)
-
-        ttk.Label(meta, text="name").grid(row=0, column=0, sticky="w", padx=(4,2), pady=2)
-        ttk.Entry(meta, textvariable=self.var_name, width=28).grid(row=0, column=1, sticky="ew", padx=(2,4), pady=2)
-
-        ttk.Label(meta, text="instanceOf").grid(row=1, column=0, sticky="w", padx=(4,2), pady=2)
-        ttk.Entry(meta, textvariable=self.var_instance, width=28).grid(row=1, column=1, sticky="ew", padx=(2,4), pady=2)
-
+        ttk.Label(meta, text="name").grid(row=0, column=0, sticky="w", padx=(4, 2), pady=2)
+        ttk.Entry(meta, textvariable=self.var_name, width=28, style="Small.TEntry").grid(
+            row=0, column=1, sticky="ew", padx=(2, 4), pady=2
+        )
+        ttk.Label(meta, text="instanceOf").grid(row=1, column=0, sticky="w", padx=(4, 2), pady=2)
+        ttk.Entry(meta, textvariable=self.var_instance, width=28, style="Small.TEntry").grid(
+            row=1, column=1, sticky="ew", padx=(2, 4), pady=2
+        )
 
         ttk.Label(self.right, text="Dettagli (opz.)", foreground="#666").pack(anchor="w", padx=8, pady=8)
         ttk.Label(
@@ -305,60 +293,57 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         ttk.Label(self, textvariable=self.status, anchor="w").grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
 
     def _build_filters(self, parent: ttk.Frame):
-        # widget per ogni colonna
         self.filters: Dict[str, tk.Variable] = {}
         grid = ttk.Frame(parent)
         grid.pack(fill="x")
 
-        # colonna -> (nome, tipo_widget)
         coldefs = [
             ("type", "combo"),
             ("label", "text"),
             ("unit", "combo"),
             ("trigger type", "combo"),
-            ("level", "text"),             # supporta >, >=, <, <=, =
+            ("level", "text"),
             ("mode", "combo"),
-            ("min interval ms", "text"),   # supporta operatori
+            ("min interval ms", "text"),
             ("skip first n changes", "text"),
             ("change mask", "combo"),
-            ("deadband", "text"),          # supporta operatori
+            ("deadband", "text"),
             ("deadband type", "combo"),
         ]
 
         for i, (name, kind) in enumerate(coldefs):
             grid.columnconfigure(i, weight=1)
-
-            # Etichetta riga 0
             ttk.Label(grid, text=name).grid(row=0, column=i, sticky="w", padx=2)
 
-            # Celle riga 1: un frame con input + pulsante sort
             cell = ttk.Frame(grid)
             cell.grid(row=1, column=i, sticky="ew", padx=2, pady=2)
-            cell.columnconfigure(0, weight=1)  # input si espande, bottone resta stretto
+            cell.columnconfigure(0, weight=1)
 
-            # Input filtro
             if kind == "combo":
                 var = tk.StringVar()
-                inp = ttk.Combobox(cell, textvariable=var, state="readonly")
+                inp = ttk.Combobox(cell, textvariable=var, state="readonly", width=10, style="Small.TCombobox")
                 inp.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
             else:
                 var = tk.StringVar()
-                inp = ttk.Entry(cell, textvariable=var)
+                inp = ttk.Entry(cell, textvariable=var, width=12, style="Small.TEntry")
                 inp.bind("<KeyRelease>", lambda e: self.apply_filters())
             inp.grid(row=0, column=0, sticky="ew")
 
-            self.filters[name] = var  # memorizzo la variabile del filtro
+            self.filters[name] = var
 
-            # Pulsantino sort (testo dipende dalla prossima direzione prevista)
             col_index = i
-            btn = ttk.Button(cell, text="A→Z", width=4, command=lambda c=col_index: self._on_sort_button(c))
+            btn = ttk.Button(cell, text="A→Z", width=3, style="Small.TButton",
+                             command=lambda c=col_index: self._on_sort_button(c))
             btn.grid(row=0, column=1, sticky="e", padx=(4, 0))
-            self.sort_dir_by_col[col_index] = True      # prossimo click = A→Z
+            self.sort_dir_by_col[col_index] = True
             self.sort_buttons[col_index] = btn
 
     # -------------- File ops ---------------
     def on_open(self):
-        path = filedialog.askopenfilename(title="Apri mapping JSON", filetypes=[("File JSON", "*.json"), ("Tutti i file", "*.*")])
+        path = filedialog.askopenfilename(
+            title="Apri mapping JSON",
+            filetypes=[("File JSON", "*.json"), ("Tutti i file", "*.*")]
+        )
         if not path:
             return
         try:
@@ -377,7 +362,6 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         if not (self.file_path and self.data):
             return
         try:
-            # Commit dalla tabella al JSON (con validazioni base)
             self._commit_table_to_json()
 
             bak = self.file_path + ".bak"
@@ -388,6 +372,7 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                     os.replace(self.file_path, bak)
             except Exception:
                 pass
+
             with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             self.status.set(f"Salvato: {self.file_path}")
@@ -398,7 +383,11 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
     def on_save_as(self):
         if not self.data:
             return
-        path = filedialog.asksaveasfilename(title="Salva come", defaultextension=".json", filetypes=[("File JSON", "*.json")])
+        path = filedialog.asksaveasfilename(
+            title="Salva come",
+            defaultextension=".json",
+            filetypes=[("File JSON", "*.json")]
+        )
         if not path:
             return
         self.file_path = path
@@ -412,12 +401,17 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         root = self.data.get("json") if isinstance(self.data, dict) else None
         if not root:
             root = self.data
+
+        # Precompila META
+        self.var_name.set(str(self.data.get("name", "")))
+        self.var_instance.set(str((root or {}).get("instanceOf", "")))
+
         props = (root or {}).get("properties", {})
         for path, obj in props.items():
             if isinstance(obj, dict):
                 self.property_items.append((path, obj))
 
-        # domini
+        # Domini
         def collect_top(key: str) -> List[str]:
             vals: List[str] = []
             for _, o in self.property_items:
@@ -429,7 +423,7 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         def collect_trig(key: str) -> List[str]:
             vals: List[str] = []
             for _, o in self.property_items:
-                for t in (o.get("sendPolicy",{}).get("triggers",[]) or []):
+                for t in (o.get("sendPolicy", {}).get("triggers", []) or []):
                     v = t.get(key)
                     if isinstance(v, str) and v not in vals:
                         vals.append(v)
@@ -441,19 +435,15 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         self.domain_trig_modes = collect_trig("mode")
         self.domain_change_masks = collect_trig("changeMask") or [""]
 
-        # popola tabella dati completa
         self._build_rows_all()
-        # inizializza filtri
         self._refresh_filter_widgets()
-        # applica filtri (iniziale: nessuno) e mostra tabella
         self.apply_filters()
 
     def _build_rows_all(self):
         self.rows_all.clear()
         self.row_to_path.clear()
         for path, obj in self.property_items:
-            tr = (obj.get("sendPolicy",{}).get("triggers",[]) or [{}])[0]
-            # deadband & type
+            tr = (obj.get("sendPolicy", {}).get("triggers", []) or [{}])[0]
             db_val: Optional[float] = None
             db_type = ""
             if "deadbandPercent" in tr and tr.get("deadbandPercent") is not None:
@@ -464,23 +454,22 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                 db_type = "ABS"
 
             row = [
-                obj.get("type", ""),               # type (top)
-                obj.get("label", ""),               # label
-                obj.get("unit", ""),                # unit
-                tr.get("type", ""),                 # trigger type
-                tr.get("level", ""),                # level
-                tr.get("mode", ""),                 # mode
-                tr.get("minIntervalMs", ""),        # min interval
-                tr.get("skipFirstNChanges", ""),    # skip first
-                tr.get("changeMask", ""),           # change mask
-                "" if db_val is None else db_val,    # deadband
-                db_type,                               # deadband type
+                obj.get("type", ""),
+                obj.get("label", ""),
+                obj.get("unit", ""),
+                tr.get("type", ""),
+                tr.get("level", ""),
+                tr.get("mode", ""),
+                tr.get("minIntervalMs", ""),
+                tr.get("skipFirstNChanges", ""),
+                tr.get("changeMask", ""),
+                "" if db_val is None else db_val,
+                db_type,
             ]
             self.rows_all.append(row)
             self.row_to_path.append(path)
 
     def _refresh_filter_widgets(self):
-        # carica domini nei combo
         def set_combo(name: str, values: List[str]):
             w = self._find_filter_widget(name)
             if isinstance(w, ttk.Combobox):
@@ -491,43 +480,47 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         set_combo("trigger type", self.domain_trig_types)
         set_combo("mode", self.domain_trig_modes)
         set_combo("change mask", self.domain_change_masks)
-        set_combo("deadband type", ["ABS", "PERC"]) 
+        set_combo("deadband type", ["ABS", "PERC"])
 
     def _find_filter_widget(self, name: str):
-        # cerca la Label con quel testo e ritorna l'input (Entry/Combobox) nella cella sotto
         for child in self.filter_bar.winfo_children():
             for sub in child.winfo_children():
                 if isinstance(sub, ttk.Label) and sub.cget("text") == name:
                     info = sub.grid_info()
-                    # widget al row successivo, stessa colonna
                     for peer in child.winfo_children():
                         if peer.grid_info().get("row") == info["row"] + 1 and peer.grid_info().get("column") == info["column"]:
-                            # dentro il peer (frame), cerca Entry/Combobox
                             for inner in peer.winfo_children():
                                 if isinstance(inner, ttk.Combobox) or isinstance(inner, ttk.Entry):
                                     return inner
         return None
 
-
     # -------------- Filtering ---------------
     def apply_filters(self):
         def match_text(val: Any, query: str) -> bool:
-            if query.strip() == "":
+            q = (query or "").strip()
+            if q == "":
                 return True
             s = str(val).lower()
-            q = query.lower()
-            # operatori numerici semplici
+            ql = q.lower()
             for op in (">=", "<=", ">", "<", "="):
-                if q.startswith(op):
+                if ql.startswith(op):
                     try:
                         num = float(q[len(op):].strip())
                         v = float(val)
-                        return eval(f"v {op} num")
                     except Exception:
                         return False
-            return q in s
+                    if op == ">":
+                        return v > num
+                    if op == ">=":
+                        return v >= num
+                    if op == "<":
+                        return v < num
+                    if op == "<=":
+                        return v <= num
+                    if op == "=":
+                        return v == num
+            return ql in s
 
-        # leggi valori filtro
         fv = {h: self._get_filter_value(h) for h in HEADERS}
 
         self.rows_view.clear()
@@ -549,13 +542,10 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                 self.rows_view.append(list(row))
                 self.view_index_map.append(i)
 
-        # aggiorna sheet
         self.sheet.set_sheet_data(self.rows_view, reset_col_positions=True, reset_row_positions=True)
         self._refresh_headers_with_arrow()
-        # riapplica l’ultimo ordinamento (se presente)
         if self._last_sort_col is not None:
             self._sort_view_by(self._last_sort_col, self._last_sort_asc)
-
 
     def _get_filter_value(self, name: str) -> str:
         w = self._find_filter_widget(name)
@@ -563,67 +553,21 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             return w.get()
         return ""
 
-    # -------------- Sorting ---------------
-   
-    def _on_header_click(self, event=None):
-        col = self._event_to_col(event)
-        if col is None:
-            # niente colonna -> esco zitto
-            return
-
-        # toggle direzione
-        if self._last_sort_col == col:
-            self._last_sort_asc = not self._last_sort_asc
-        else:
-            self._last_sort_col = col
-            self._last_sort_asc = True
-
-        # ordina + seleziona visivamente
-        self._sort_view_by(col, self._last_sort_asc)
-        try:
-            self.sheet.select_column(col)
-        except Exception:
-            pass
-
-        # feedback chiaro in statusbar (utile anche per debug)
-        direction = "A→Z" if self._last_sort_asc else "Z→A"
-        try:
-            header_text = HEADERS[col]
-        except Exception:
-            header_text = f"col {col}"
-        self.status.set(f"Ordinato per {header_text} ({direction})")
-
+    # -------------- Sorting (da pulsanti accanto ai filtri) ---------------
     def _on_sort_button(self, col: int):
-        """
-        Ordina la tabella per la colonna 'col'.
-        Il pulsante alterna A→Z / Z→A ad ogni pressione.
-        """
-        # direzione corrente (quella da usare ORA)
         asc = self.sort_dir_by_col.get(col, True)
-
-        # memorizza come "ultimo ordinamento" globale (per mantenere l'ordinamento dopo i filtri)
         self._last_sort_col = col
         self._last_sort_asc = asc
-
-        # ordina
         self._sort_view_by(col, asc)
-
-        # prepara prossima direzione per questa colonna e aggiorna etichetta del pulsante
         self.sort_dir_by_col[col] = not asc
         self._update_sort_button_label(col)
 
     def _update_sort_button_label(self, col: int):
-        """
-        Aggiorna la scritta del pulsante in base alla prossima direzione prevista.
-        True  -> "A→Z"
-        False -> "Z→A"
-        """
         btn = self.sort_buttons.get(col)
         if not btn:
             return
         next_is_asc = self.sort_dir_by_col.get(col, True)
         btn.configure(text=("A→Z" if next_is_asc else "Z→A"))
-
 
     def _sort_view_by(self, col: int, ascending: bool):
         pairs = list(zip(self.rows_view, self.view_index_map))
@@ -633,9 +577,9 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             v = row[col]
             if col in NUMERIC_COLS:
                 try:
-                    return (0, float(v))   # numeri prima
+                    return (0, float(v))
                 except Exception:
-                    return (1, str(v).lower())  # non numerici dopo
+                    return (1, str(v).lower())
             return (0, str(v).lower())
 
         pairs.sort(key=key_fn, reverse=not ascending)
@@ -643,8 +587,6 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
         self.view_index_map = [i for _, i in pairs]
         self.sheet.set_sheet_data(self.rows_view, reset_col_positions=False, reset_row_positions=True)
         self._refresh_headers_with_arrow()
-
-
 
     # -------------- In-cell editing helpers ---------------
     def _on_begin_edit_cell(self, _event=None):
@@ -660,17 +602,14 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             row, col = sel[0], sel[1]
         else:
             return
-        # memorizza valore precedente
         try:
             self._prev_cell_value = self.sheet.get_cell_data(row, col)
         except Exception:
             self._prev_cell_value = None
-        # se deadband type -> apri combo overlay
         if col == IDX["deadband type"]:
             self.after(1, lambda r=row, c=col: self._open_deadband_combo(r, c))
 
     def _on_double_click_cell(self, _event=None):
-        # fallback: su doppio click in deadband type apri combo
         sel = None
         try:
             sel = self.sheet.get_currently_selected()
@@ -686,7 +625,6 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             self._open_deadband_combo(row, col)
 
     def _on_end_edit_cell(self, _event=None):
-        # valida i valori dopo edit (gestisce anche paste)
         sel = None
         try:
             sel = self.sheet.get_currently_selected()
@@ -705,18 +643,15 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             except Exception:
                 return
             if val not in ("ABS", "PERC"):
-                # ripristina precedente (o stringa vuota)
                 prev = self._prev_cell_value
                 if prev in ("ABS", "PERC"):
                     self.sheet.set_cell_data(row, col, prev)
                 else:
                     self.sheet.set_cell_data(row, col, "")
             else:
-                # normalizza uppercase
                 self.sheet.set_cell_data(row, col, val)
 
     def _open_deadband_combo(self, row: int, col: int):
-        # chiudi eventuale combo precedente
         if self._overlay_combo is not None:
             try:
                 self._overlay_combo.destroy()
@@ -724,7 +659,6 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                 pass
             self._overlay_combo = None
             self._overlay_cell = None
-        # bbox cella
         try:
             x, y, w, h = self.sheet.get_cell_bbox(row, col, include_text=True)
         except Exception:
@@ -765,46 +699,39 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
     def _commit_table_to_json(self):
         if not self.data:
             return
-        # sincronizza rows_view -> rows_all (l'utente può aver editato nella vista filtrata)
-        # leggiamo i dati attuali della sheet
-        current = [list(r) for r in self.sheet.get_sheet_data()]  # copia profonda semplice
-        # aggiorna rows_view con current e propaga a rows_all per le righe visibili
+
+        # sincr. vista -> all (solo righe visibili)
+        current = [list(r) for r in self.sheet.get_sheet_data()]
         for idx_view, row_vals in enumerate(current):
             idx_all = self.view_index_map[idx_view]
             self.rows_all[idx_all] = row_vals
 
-        # applica rows_all nel JSON
         root = self.data.get("json") or self.data
 
         # commit meta
         nm = self.var_name.get().strip()
         if nm != "":
             self.data["name"] = nm
-
         inst = self.var_instance.get().strip()
         if inst != "":
             root["instanceOf"] = inst
 
-
         props = root.get("properties", {})
-
         errors: List[str] = []
+
         for i, row in enumerate(self.rows_all):
             path = self.row_to_path[i]
             obj = props.get(path, {})
 
-            # top-level
             obj_type = str(row[IDX["type"]]).strip()
             obj_label = str(row[IDX["label"]]).strip()
-            obj_unit  = str(row[IDX["unit"]]).strip()
-
+            obj_unit = str(row[IDX["unit"]]).strip()
             if obj_type: obj["type"] = obj_type
             if obj_label != "": obj["label"] = obj_label
             if obj_unit != "": obj["unit"] = obj_unit
-            elif "unit" in obj: # consenti vuoto -> rimuovi
+            elif "unit" in obj:
                 obj.pop("unit", None)
 
-            # trigger[0]
             tr_list = obj.setdefault("sendPolicy", {}).setdefault("triggers", [])
             if not tr_list:
                 tr_list.append({})
@@ -812,12 +739,12 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
 
             trig_type = str(row[IDX["trigger type"]]).strip()
             level = row[IDX["level"]]
-            mode  = str(row[IDX["mode"]]).strip()
+            mode = str(row[IDX["mode"]]).strip()
             minint = row[IDX["min interval ms"]]
-            skipn  = row[IDX["skip first n changes"]]
-            cmask  = str(row[IDX["change mask"]]).strip()
-            db     = row[IDX["deadband"]]
-            dbt    = str(row[IDX["deadband type"]]).strip().upper()
+            skipn = row[IDX["skip first n changes"]]
+            cmask = str(row[IDX["change mask"]]).strip()
+            db = row[IDX["deadband"]]
+            dbt = str(row[IDX["deadband type"]]).strip().upper()
 
             if trig_type: tr["type"] = trig_type
             if mode != "": tr["mode"] = mode
@@ -827,8 +754,7 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                 if str(level).strip() == "":
                     tr.pop("level", None)
                 else:
-                    lv = int(level)
-                    tr["level"] = lv
+                    tr["level"] = int(level)
             except Exception:
                 errors.append(f"{path}: 'level' non valido")
 
@@ -854,7 +780,7 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             except Exception:
                 errors.append(f"{path}: 'skip first n changes' non valido (>=0)")
 
-            # change mask (string dominio, consenti vuoto = rimuovi)
+            # change mask
             if cmask == "":
                 tr.pop("changeMask", None)
             else:
@@ -866,7 +792,6 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                     tr.pop("deadband", None)
                     tr.pop("deadbandPercent", None)
                 elif dbt == "ABS":
-                    # float >= 0
                     if str(db).strip() == "":
                         tr.pop("deadband", None)
                         tr.pop("deadbandPercent", None)
@@ -881,8 +806,7 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
                         tr.pop("deadbandPercent", None)
                     else:
                         v = float(db)
-                        if not (0.0 <= v <= 100.0):
-                            raise ValueError
+                        if not (0.0 <= v <= 100.0): raise ValueError
                         tr["deadbandPercent"] = v
                         tr.pop("deadband", None)
                 else:
@@ -890,18 +814,16 @@ A destra puoi inserire funzioni future (diff, preset, ecc.)"""
             except Exception:
                 errors.append(f"{path}: 'deadband' non valido")
 
-            # riassegna obj nel props (non strettamente necessario in-place)
             props[path] = obj
 
         if errors:
             raise ValueError("\n".join(errors))
 
 # ---------------- main ----------------
-
 def main():
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.geometry("1300x720")  # finestra più ampia, ridimensionabile
+    root.geometry("1300x720")
     root.minsize(1024, 600)
     try:
         from ctypes import windll
@@ -912,19 +834,21 @@ def main():
     app = MappingEditor(root)
 
     # auto-load se il file è a fianco dello script
-    default_path = os.path.join(os.path.dirname(__file__), "2500053_Mapping.json")
+    try:
+        base = os.path.dirname(__file__)
+    except NameError:
+        base = os.getcwd()
+    default_path = os.path.join(base, "2500053_Mapping.json")
+
     if os.path.exists(default_path):
         try:
             with open(default_path, "r", encoding="utf-8") as f:
                 app.data = json.load(f)
             app.file_path = default_path
-            if Sheet is None:
-                pass
-            else:
-                app.btn_save.config(state=tk.NORMAL)
-                app.btn_save_as.config(state=tk.NORMAL)
-                app.status.set(f"Caricato: {os.path.basename(default_path)}")
-                app._reindex()
+            app.btn_save.config(state=tk.NORMAL)
+            app.btn_save_as.config(state=tk.NORMAL)
+            app.status.set(f"Caricato: {os.path.basename(default_path)}")
+            app._reindex()
         except Exception as e:
             messagebox.showwarning(APP_TITLE, f"""Apertura iniziale fallita:
 {e}""")
